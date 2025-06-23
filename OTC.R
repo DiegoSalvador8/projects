@@ -6,26 +6,7 @@ library(RColorBrewer)
 library(patchwork)
 library(tidyr)
 library(dplyr)
-yields <- read_excel("~/JOBS/RESEARCH ASSISTANT, ECONOMICS DEPARTMENT AT SAC STATE/Citrus ACP & HLB Risk Project/Literature/OTC/Data/OTC_model(2).xlsx", 
-                           sheet = "figure data", range = "A48:M68")
-prices_yields <- read_excel("~/JOBS/RESEARCH ASSISTANT, ECONOMICS DEPARTMENT AT SAC STATE/Citrus ACP & HLB Risk Project/Literature/OTC/Data/OTC_model(2).xlsx", 
-                                            sheet = "figure data", range = "A71:AK91")
-average_prices_OTC_ACP <- read_excel("~/JOBS/RESEARCH ASSISTANT, ECONOMICS DEPARTMENT AT SAC STATE/Citrus ACP & HLB Risk Project/Literature/OTC/Data/spraying_otc_budget_model.xlsx", 
-                           sheet = "Figure Data", range = "A55:Y75")
-high_prices_OTC_ACP <- read_excel("~/JOBS/RESEARCH ASSISTANT, ECONOMICS DEPARTMENT AT SAC STATE/Citrus ACP & HLB Risk Project/Literature/OTC/Data/spraying_otc_budget_model.xlsx", 
-                           sheet = "Figure Data", range = "A80:Y100") 
-original_spraying<-read_excel("~/JOBS/RESEARCH ASSISTANT, ECONOMICS DEPARTMENT AT SAC STATE/Citrus ACP & HLB Risk Project/Literature/OTC/Data/original_spraying_model.xlsx",
-                              sheet = "Figure Data", range = "A2:D22")
-yields_spraying<-read_excel("~/JOBS/RESEARCH ASSISTANT, ECONOMICS DEPARTMENT AT SAC STATE/Citrus ACP & HLB Risk Project/Literature/OTC/Data/original_spraying_model.xlsx",
-                              sheet = "Figure Data", range = "F2:J22")
-hlb_severity<-read_excel("~/JOBS/RESEARCH ASSISTANT, ECONOMICS DEPARTMENT AT SAC STATE/Citrus ACP & HLB Risk Project/Literature/OTC/Data/original_spraying_model.xlsx",
-                         sheet = "Figure Data", range = "K2:N22")
-yields_OTC_ACP<-read_excel("~/JOBS/RESEARCH ASSISTANT, ECONOMICS DEPARTMENT AT SAC STATE/Citrus ACP & HLB Risk Project/Literature/OTC/Data/spraying_otc_budget_model.xlsx",
-                           sheet = "Figure Data", range = "A104:F124")
-average_prices_ACP <- read_excel("~/JOBS/RESEARCH ASSISTANT, ECONOMICS DEPARTMENT AT SAC STATE/Citrus ACP & HLB Risk Project/Literature/OTC/Data/spraying_otc_budget_model.xlsx", 
-                                     sheet = "Figure Data", range = "A126:M146")
-high_prices_ACP <- read_excel("~/JOBS/RESEARCH ASSISTANT, ECONOMICS DEPARTMENT AT SAC STATE/Citrus ACP & HLB Risk Project/Literature/OTC/Data/spraying_otc_budget_model.xlsx", 
-                                  sheet = "Figure Data", range = "A148:M168") 
+
 save(yields, prices_yields, average_prices_OTC_ACP,
      high_prices_OTC_ACP, original_spraying,yields_spraying,hlb_severity, yields_OTC_ACP,
      average_prices_ACP, high_prices_ACP,
