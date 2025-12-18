@@ -1,0 +1,586 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+```{r}
+required <- c("readr","dplyr","stringr","fixest","broom","gt","ggplot2","tidyr","forcats","janitor","countrycode","scales","stargazer","fixest","ggthemes","cowplot","AER","plm")
+to_install <- setdiff(required, rownames(installed.packages()))
+if (length(to_install) > 0) install.packages(to_install, repos = "https://cloud.r-project.org")
+invisible(lapply(required, library, character.only = TRUE))
+
+
+```
+
+```{r}
+
+# quick percent→decimal normalizer that auto-detects units
+normalize_rate <- function(x, pct_threshold = 1.0, share_cutoff = 0.05) {
+  x_num <- suppressWarnings(as.numeric(x))
+  if (!any(is.finite(x_num))) return(x_num)
+  share_gt1 <- mean(x_num > pct_threshold, na.rm = TRUE)
+  if (is.na(share_gt1)) share_gt1 <- 0
+  if (share_gt1 > share_cutoff) x_num/100 else x_num
+}
+
+# manual country name fixes for TRAINS/WITS naming quirks
+manual_iso3 <- function(name_vec) {
+  nm <- name_vec
+  nm <- stringr::str_trim(nm)
+  out <- countrycode(nm, "country.name", "iso3c", warn = FALSE)
+
+  # targeted overrides (extend as needed)
+  special <- c(
+    "Hong Kong, China" = "HKG",
+    "Macao"            = "MAC",
+    "Cote d'Ivoire"    = "CIV",
+    "Côte d'Ivoire"    = "CIV",
+    "Congo, Dem. Rep." = "COD",
+    "Congo, Rep."      = "COG",
+    "Kyrgyz Republic"  = "KGZ",
+    "Eswatini"         = "SWZ",
+    "Lao PDR"          = "LAO",
+    "Viet Nam"         = "VNM",
+    "Türkiye"          = "TUR",
+    "Curacao"          = "CUW",
+    "Curaçao"          = "CUW",
+    "Serbia, FRY"      = "SRB",
+    "Serbia and Montenegro" = "SRB",
+    "Kosovo"           = "XKX",
+    "Bolivia (Plurinational State of)" = "BOL",
+    "North Macedonia"  = "MKD",
+    "Russian Federation" = "RUS",
+    "State of Palestine" = "PSE",
+    "Syrian Arab Republic" = "SYR",
+    "United Kingdom"   = "GBR",
+    "United States"    = "USA"
+  )
+  idx <- match(nm, names(special), nomatch = 0)
+  out[idx > 0] <- unname(special[idx])
+  out
+}
+
+#Trade
+
+trade_raw <-read.csv("DATA/trade/trade3.csv")
+colnames(trade_raw)
+
+trade <- trade_raw |>
+  filter(str_to_lower(TradeFlowName) == "import" | is.na(TradeFlowName)) |>
+  transmute(
+    exporter_iso3 = PartnerISO3,
+    exporter_name = PartnerName,
+    hs            = as.integer(ProductCode),
+    year          = as.integer(Year),
+    trade_value   = TradeValue.in.1000.USD
+  ) |>
+  filter(is.finite(year), is.finite(hs))
+
+
+#Tariffs
+
+tar_raw <- suppressWarnings(
+  readr::read_csv("tariffs3.csv", guess_max = 200000,
+                  locale = readr::locale(encoding = "latin1"))
+) |>
+  janitor::clean_names()
+colnames(tar_raw)
+
+#Looking at AHS duty
+tar <- tar_raw |>
+  filter(str_to_upper(reporter_name) == "UNITED STATES",
+         str_to_upper(duty_type)     == "AHS") |>
+  transmute(
+    exporter_name_tar = partner_name,
+    exporter_iso3_tar = manual_iso3(partner_name),
+    hs                = as.integer(product),
+    year              = as.integer(tariff_year),
+    tariff_ahs_raw    = simple_average
+  ) |>
+  filter(is.finite(year), is.finite(hs))
+
+# Tariff to decimals
+tar <- tar |>
+  mutate(
+    tariff_ahs = case_when(
+      tariff_ahs_raw > 1 & tariff_ahs_raw <= 100 ~ tariff_ahs_raw / 100,  # convert percent to proportion
+      tariff_ahs_raw > 100 | tariff_ahs_raw < 0  ~ NA_real_,               # drop impossible values
+      TRUE ~ tariff_ahs_raw                                                   # already in [0,1]
+    )
+  ) |>
+  select(exporter_iso3_tar, hs, year, tariff_ahs)
+
+summary(tar$tariff_ahs)
+
+#Merge
+trade <- trade |>
+  mutate(
+    exporter_iso3_fallback = manual_iso3(exporter_name),
+    exporter_iso3 = if_else(is.na(exporter_iso3) | exporter_iso3 == "",
+                            exporter_iso3_fallback, exporter_iso3)
+  ) |>
+  select(-exporter_iso3_fallback)
+
+# Merge on exporter_iso3, hs, year
+panel <- trade |>
+  left_join(
+    tar,
+    by = join_by(hs, year, exporter_iso3 == exporter_iso3_tar)
+  )
+
+readr::write_csv(trade, "trade_clean2.csv")
+readr::write_csv(tar,   "tariffs_clean2.csv")
+readr::write_csv(panel, "panel_merged2.csv")
+
+cat("\nFiles written:\n",
+    "- trade_clean2.csv\n",
+    "- tariffs_clean2.csv\n",
+    "- panel_merged2.csv  (units: trade_value = as in source; tariff_ahs = decimal)\n")
+
+```
+
+
+```{r}
+#Non-tariffs
+
+ntm2014 <- read_csv("us_ntm2014.csv")
+ntm2017 <- read_csv("us_ntm2017.csv")
+ntm2018 <- read_csv("us_ntm2018.csv")
+ntm2019 <- read_csv("us_ntm2019.csv")
+
+ntm_all <- bind_rows(ntm2014, ntm2017, ntm2018, ntm2019)
+
+#SPS and TBT counts
+
+ntm_all <- ntm_all %>%
+  mutate(
+    type = case_when(
+      str_starts(NTMCode, "A") ~ "sps",
+      str_starts(NTMCode, "B") ~ "tbt",
+      TRUE ~ NA_character_
+    ),
+    hs = as.integer(str_extract(as.character(ProductCode), "\\d+"))
+  )
+
+ntm_counts <- ntm_all %>%
+  group_by(Partner, hs, Year, type) %>%
+  summarise(n_measures = n_distinct(NTMCode), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = type, values_from = n_measures, values_fill = 0) %>%
+  rename(ntm_sps = sps, ntm_tbt = tbt,
+         exporter_iso3 = Partner,
+         snapshot_year = Year)
+
+#Data availability issue. Assume NTMs remained constant from 2014 until the new report on 2017. Additionally, assume the same for 2019 onward.
+full_years <- 2014:2023
+
+grid <- ntm_counts %>%
+  distinct(exporter_iso3, hs) %>%
+  tidyr::expand(exporter_iso3, hs, year = full_years) %>%
+  mutate(
+    snapshot_year = case_when(
+      year >= 2014 & year <= 2016 ~ 2014L,
+      year == 2017                ~ 2017L,
+      year == 2018                ~ 2018L,
+      year >= 2019 & year <= 2023 ~ 2019L,
+      TRUE ~ NA_integer_
+    )
+  )
+
+ntm_fixed <- grid %>%
+  left_join(ntm_counts, by = c("exporter_iso3","hs","snapshot_year")) %>%
+  select(exporter_iso3, hs, year, ntm_sps, ntm_tbt)
+
+#Merge
+
+panel <- read_csv("panel_merged2.csv", guess_max = 3e5, show_col_types = FALSE) %>%
+  mutate(hs = as.integer(hs)) %>%
+  filter(hs >= 1L, hs <= 24L, year >= 2014L, year <= 2023L)
+
+panel_final2 <- panel %>%
+  left_join(ntm_fixed, by = c("exporter_iso3","hs","year"))
+
+write_csv(panel_final2, "panel_final2.csv")
+cat("Wrote: panel_final2.csv\n")
+panel_final2<-read.csv("panel_final2.csv")
+panel_final2<-as.data.frame(panel_final2)
+```
+
+
+```{r}
+#Convert to real USD, "GDPDEF" on FRED data with 2017 as base
+
+CPI <- tibble(
+  year = 2014:2023,
+  deflator = c(96.41, 97.31, 98.24, 99.99, 102.29, 103.97, 105.36, 110.16, 118.01, 122.38)
+)
+
+panel_final2 <- panel_final2 %>%
+  left_join(CPI, by = "year") %>%
+  mutate(trade_value = trade_value / (deflator / 100))
+
+
+colnames(panel_final2)
+
+#Estimation
+#Justify the inclusion of the three fixed effects for the model estimation, (this is a three way model)
+#Drop all fixed effects first
+m_pooled_noFE <- fepois(
+  trade_value ~ log1p(tariff_ahs) +
+                     log1p(ntm_sps) +
+                     log1p(ntm_tbt),
+  data = panel_final2
+)
+summary(m_pooled_noFE)
+#Notes on this model: Extremely low Pseudo R2, crappy.
+
+#Run a model with only one type of fixed effects, then repeat it 
+m_no_exporteryear <- fepois(
+  trade_value ~ log1p(tariff_ahs):factor(hs) +
+                     log1p(ntm_sps):factor(hs) +
+                     log1p(ntm_tbt):factor(hs) |
+                     hs^year + exporter_iso3^hs,
+  cluster = ~ exporter_iso3 + hs,
+  data = panel_final2
+)
+summary(m_no_exporteryear)
+
+m_no_hsyear <- fepois(
+  trade_value ~ log1p(tariff_ahs):factor(hs) +
+                     log1p(ntm_sps):factor(hs) +
+                     log1p(ntm_tbt):factor(hs) |
+                     exporter_iso3^year + exporter_iso3^hs,
+  cluster = ~ exporter_iso3 + hs,
+  data = panel_final2
+)
+summary(m_no_hsyear)
+
+m_no_exporterhs <- fepois(
+  trade_value ~ log1p(tariff_ahs):factor(hs) +
+                     log1p(ntm_sps):factor(hs) +
+                     log1p(ntm_tbt):factor(hs) |
+                     exporter_iso3^year + hs^year,
+  cluster = ~ exporter_iso3 + hs,
+  data = panel_final2
+)
+summary(m_no_exporterhs)
+
+#Model with all the fixed effects
+gravity <- fepois(
+  trade_value ~ log1p(tariff_ahs)
+               + log1p(ntm_sps)
+               + log1p(ntm_tbt)
+  | exporter_iso3^year + hs^year + exporter_iso3^hs,
+  cluster = ~ exporter_iso3 + hs,
+  data = panel_final2
+)
+
+summary(gravity)
+#Comparison between the models: Include a section in the econometric analysis part that mentions how the pseudo R2 is the highest when includint the three fixed effects, that should be enough.
+
+#Notes: The classical FE vs RE Hausman test cannot be ran here because the PPLM violates the assumptions (look it up for justification later)
+#Compare PPML-HDFE vs Random Effects Poison. This is what the gravity handbook (Yotov et al., 2016) and Correia, Guimarães, Zylkin (2019) recommend.
+library(glmmTMB)
+m_randomeffects <- glmmTMB(
+  trade_value ~ log1p(tariff_ahs) + log1p(ntm_sps) + log1p(ntm_tbt) +
+    (1 | exporter_iso3) + (1 | hs),
+  data = panel_final2,
+  family = poisson()
+)
+
+etable(gravity, m_randomeffects, vcov = "iid")
+
+library(dplyr)
+library(broom)
+library(broom.mixed)
+fe_tab <- broom::tidy(gravity) |>
+  filter(grepl("log1p\\(", term)) |>
+  select(term, beta_fe = estimate)
+
+re_tab <- broom.mixed::tidy(m_randomeffects, effects = "fixed") |>
+  filter(grepl("log1p\\(", term)) |>
+  select(term, beta_re = estimate)
+
+comparison <- left_join(fe_tab, re_tab, by = "term")
+comparison
+
+```
+
+
+```{r}
+etable(
+  gravity,
+  se = "twoway",
+  fitstat = ~ n + ll + pr2,
+  tex = TRUE,
+  style.tex = style.tex("aer"),
+  title = "PPML Estimates of Tariff and Non-Tariff Effects by HS Chapter",
+  label = "tab:ppml_results",
+  notes = "PPML with exporter×year, HS×year, and exporter×HS fixed effects. Two-way clustered SEs (exporter, HS). Significance: * p<0.10, ** p<0.05, *** p<0.01.",
+  file = "table_ppml.tex"
+)
+
+summary(pooled)
+etable(
+  pooled,
+  se = "twoway",
+  fitstat = ~ n + ll + pr2,
+  tex = TRUE,
+  style.tex = style.tex("aer"),
+  title = "PPML Estimates of Tariff and Non-Tariff Effects on Agricultural Imports",
+  label = "tab:ppml_results_pooled",
+  notes = "PPML with exporter×year, HS×year, and exporter×HS fixed effects. Two-way clustered SEs (exporter, HS). Significance: * p<0.10, ** p<0.05, *** p<0.01.",
+  file = "table_ppml_pooled.tex"
+)
+
+
+```
+
+```{r}
+#Assignment: Data exploration
+# FIGURE 1: Total imports over time
+
+imports_by_year <- panel_final2 %>%
+  group_by(year) %>%
+  summarise(total_imports = sum(trade_value, na.rm = TRUE), .groups = "drop")
+
+# Display it
+print(imports_by_year)
+
+panel_final2 |>
+  group_by(year) |>
+  summarise(total_imports = sum(trade_value, na.rm=TRUE), .groups="drop") |>
+  ggplot(aes(x = year, y = total_imports)) +
+  geom_line(size = 1,color = "blue") +
+  labs(x = "Year", y = "Total Imports (Thousand USD)") +
+  scale_y_continuous(breaks = pretty_breaks(8),
+                     labels = scales::dollar_format(prefix = "$"))+
+  scale_x_continuous(breaks = pretty_breaks(10))+
+  theme_classic(base_size = 12) + theme(text = element_text(family = "serif"),
+                                        legend.position = "bottom")
+
+
+#Figure 3: trade vs tariff scatterplot
+
+ggplot(panel_final2, aes(x=tariff_ahs, y=trade_value)) +
+  geom_point() +
+  labs(x = "AHS Tariff (proportion)",
+    y = "Imports (Million USD)"
+  ) +
+  scale_y_continuous(
+    breaks = pretty_breaks(4),
+    labels = scales::dollar_format(prefix = "$")
+  ) +
+  scale_x_continuous(breaks = pretty_breaks(4)) +
+  theme_classic(base_size = 12) +
+  theme(
+    text = element_text(family = "serif"),
+    legend.position = "bottom",
+    strip.text = element_text(face = "bold")
+  )
+
+ggplot(panel_final2, aes(x=ntm_sps, y=trade_value)) +
+  geom_point() +
+  labs(x = "SPS (count)",
+    y = "Imports (Million USD)"
+  ) +
+  scale_y_continuous(
+    breaks = pretty_breaks(4),
+    labels = scales::dollar_format(prefix = "$")
+  ) +
+  scale_x_continuous(breaks = pretty_breaks(4)) +
+  theme_classic(base_size = 12) +
+  theme(
+    text = element_text(family = "serif"),
+    legend.position = "bottom",
+    strip.text = element_text(face = "bold")
+  )
+
+ggplot(panel_final2, aes(x=ntm_tbt, y=trade_value)) +
+  geom_point() +
+  labs(x = "TBT (count)",
+    y = "Imports (Million USD)"
+  ) +
+  scale_y_continuous(
+    breaks = pretty_breaks(4),
+    labels = scales::dollar_format(prefix = "$")
+  ) +
+  scale_x_continuous(breaks = pretty_breaks(4)) +
+  theme_classic(base_size = 12) +
+  theme(
+    text = element_text(family = "serif"),
+    legend.position = "bottom",
+    strip.text = element_text(face = "bold")
+  )
+
+
+# Figure 4: Top 5 expoters
+top5 <- panel_final2 %>%
+  group_by(exporter_iso3) %>%
+  summarise(total_trade = sum(trade_value, na.rm = TRUE)) %>%
+  arrange(desc(total_trade)) %>%
+  slice_head(n = 5) %>%
+  pull(exporter_iso3)
+
+top5_plot <- panel_final2 %>%
+  filter(exporter_iso3 %in% top5) %>%
+  group_by(year, exporter_iso3) %>%
+  summarise(total_trade = sum(trade_value, na.rm = TRUE), .groups = "drop")
+
+
+
+ggplot(top5_plot, aes(x = year, y = total_trade, color = exporter_iso3, group = exporter_iso3)) +
+  geom_line(size = 1) +
+  geom_point(size = 1.5) +
+  scale_color_brewer(palette = "Dark2") +
+  labs(
+    title = "Top 5 Exporters of Agricultural Goods to the U.S. (2014–2023)",
+    x = "Year",
+    y = "Imports (Billion USD)",
+    color = "Exporter"
+  ) +
+  scale_y_continuous(labels = label_number_si(unit = "B", accuracy = 0.1)) +
+  theme_classic(base_size = 12) +
+  theme(
+    text = element_text(family = "serif"),
+    legend.position = "bottom",
+    strip.text = element_text(face = "bold")
+  )
+
+# Figure 5: NTMs and Imports
+snapshot_years <- c(2014, 2017, 2018, 2019)
+
+panel_final2 %>%
+  filter(year %in% snapshot_years, !is.na(ntm_sps), !is.na(trade_value)) %>%
+  ggplot(aes(x = ntm_sps, y = trade_value)) +
+  geom_jitter(width = 0.2, alpha = 0.2, size = 0.8, color = "black") +
+  facet_wrap(~ year, ncol = 2, scales = "free_y") +
+  scale_x_continuous(breaks = 0:20) +
+  scale_y_continuous(
+    labels = dollar_format(prefix = "$"),
+    breaks = pretty_breaks(4)
+  ) +
+  labs(
+    title = "Trade (Real) vs SPS Measures by Year Blocks",
+    x = "SPS Measures (count)",
+    y = "Imports (USD)"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    text = element_text(family = "serif"),
+    strip.text = element_text(face = "bold")
+  )
+
+panel_final2 %>%
+  filter(year %in% snapshot_years, !is.na(ntm_tbt), !is.na(trade_value)) %>%
+  ggplot(aes(x = ntm_tbt, y = trade_value)) +
+  geom_jitter(width = 0.2, alpha = 0.2, size = 0.8, color = "black") +
+  facet_wrap(~ year, ncol = 2, scales = "free_y") +
+  scale_x_continuous(breaks = 0:20) +
+  scale_y_continuous(
+    labels = dollar_format(prefix = "$"),
+    breaks = pretty_breaks(4)
+  ) +
+  labs(
+    title = "Trade (Real) vs TBT Measures by Year Blocks",
+    x = "TBT Measures (count)",
+    y = "Imports (USD)"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    text = element_text(family = "serif"),
+    strip.text = element_text(face = "bold")
+  )
+
+max(panel_final2$ntm_sps, na.rm = TRUE)
+max(panel_final2$ntm_tbt, na.rm = TRUE)
+
+# Figure 6: Top 5 product groups traded
+
+hs_labels <- tibble::tibble(
+  hs = 1:24,
+  hs_name = c(
+    "Live animals","Meat","Fish & crust.","Dairy & eggs","Animal prod. n.e.s.",
+    "Live plants","Vegetables","Fruit & nuts","Coffee/tea/spices","Cereals",
+    "Milling products","Oil seeds etc.","Gums/resins","Plaiting materials",
+    "Fats & oils","Prep. meat/fish","Sugars","Cocoa","Prep. cereals",
+    "Prep. veg/fruit","Misc. edible","Beverages","Residues/fodder","Tobacco"
+  )
+)
+
+top5_hs <- panel_final2 %>%
+  group_by(hs) %>%
+  summarise(total_usd = sum(trade_value, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(total_usd)) %>%
+  slice_head(n = 5) %>%
+  left_join(hs_labels, by = "hs")
+
+top5_trend <- panel_final2 %>%
+  filter(hs %in% top5_hs$hs) %>%
+  group_by(year, hs) %>%
+  summarise(trade_bil = sum(trade_value, na.rm = TRUE), .groups = "drop") %>%
+  left_join(hs_labels, by = "hs") %>%
+  mutate(hs_label = sprintf("%02d %s", hs, hs_name))
+
+ggplot(top5_trend, aes(x = year, y = trade_bil, color = hs_label)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 1.6) +
+  labs(
+    title = "Top 5 HS Chapters by U.S. Agricultural Imports (2014–2023)",
+    x = "Year",
+    y = "Imports (Billion USD)",
+    color = "HS Chapter"
+  ) +
+  scale_y_continuous(labels = label_number_si(unit = "B", accuracy = 0.1)) +
+  theme_classic(base_size = 12) +
+  theme(text = element_text(family = "serif"),
+        legend.position = "bottom")
+
+# Figure 7: Bar chart, trade by HS code per year
+
+agg_hs_year <- panel_final2 %>%
+  group_by(year, hs) %>%
+  summarise(total_trade = sum(trade_value, na.rm = TRUE), .groups = "drop")
+
+ggplot(agg_hs_year, aes(x = factor(year), y = total_trade / 1e9, fill = factor(hs))) +
+  geom_bar(stat = "identity") +
+  scale_fill_viridis_d(option = "turbo") +
+  labs(
+    title = "U.S. Agricultural Imports by HS Chapter (2014–2023)",
+    x = "Year",
+    y = "Imports (Billion USD)",
+    fill = "HS Chapter"
+  ) +
+  scale_y_continuous(labels = label_number_si(unit = "B", accuracy = 0.1)) +
+  theme_classic(base_size = 12) +
+  theme(text = element_text(family = "serif"))
+
+panel_final2<-as.data.frame(panel_final2)
+colnames(panel_final2)
+
+#More tables
+unique(panel_final2$exporter_name) #all countries
+n_distinct(panel_final2$exporter_name) #number of countries
+
+
+#Summary stats,pooled
+stargazer(panel_final2[c("trade_value", "tariff_ahs","ntm_sps", "ntm_tbt")], type="latex", title="Summary Statistics for 2014-2023", out="table2014-2023.tex", flip=FALSE)
+panel_final2014<-subset(panel_final2,year=="2014")
+panel_final2017<-subset(panel_final2,year=="2017")
+panel_final2018<-subset(panel_final2,year=="2018")
+panel_final2019<-subset(panel_final2,year=="2019")
+data_2014<-as.data.frame(panel_final2014)
+data_2017<-as.data.frame(panel_final2017)
+data_2018<-as.data.frame(panel_final2018)
+data_2019<-as.data.frame(panel_final2019)
+
+stargazer(data_2014[c("trade_value", "tariff_ahs","ntm_sps", "ntm_tbt")], type="latex", title="Summary Statistics for 2014", out="table2014.tex", flip=FALSE)
+stargazer(data_2017[c("trade_value", "tariff_ahs","ntm_sps", "ntm_tbt")], type="latex", title="Summary Statistics for 2014", out="table2014.tex", flip=FALSE)
+stargazer(data_2018[c("trade_value", "tariff_ahs","ntm_sps", "ntm_tbt")], type="latex", title="Summary Statistics for 2014", out="table2014.tex", flip=FALSE)
+stargazer(data_2019[c("trade_value", "tariff_ahs","ntm_sps", "ntm_tbt")], type="latex", title="Summary Statistics for 2014", out="table2014.tex", flip=FALSE)
+
+```
+
