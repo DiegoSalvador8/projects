@@ -279,33 +279,7 @@ gravity <- fepois(
 )
 
 summary(gravity)
-#Comparison between the models: Include a section in the econometric analysis part that mentions how the pseudo R2 is the highest when includint the three fixed effects, that should be enough.
 
-#Notes: The classical FE vs RE Hausman test cannot be ran here because the PPLM violates the assumptions (look it up for justification later)
-#Compare PPML-HDFE vs Random Effects Poison. This is what the gravity handbook (Yotov et al., 2016) and Correia, Guimarães, Zylkin (2019) recommend.
-library(glmmTMB)
-m_randomeffects <- glmmTMB(
-  trade_value ~ log1p(tariff_ahs) + log1p(ntm_sps) + log1p(ntm_tbt) +
-    (1 | exporter_iso3) + (1 | hs),
-  data = panel_final2,
-  family = poisson()
-)
-
-etable(gravity, m_randomeffects, vcov = "iid")
-
-library(dplyr)
-library(broom)
-library(broom.mixed)
-fe_tab <- broom::tidy(gravity) |>
-  filter(grepl("log1p\\(", term)) |>
-  select(term, beta_fe = estimate)
-
-re_tab <- broom.mixed::tidy(m_randomeffects, effects = "fixed") |>
-  filter(grepl("log1p\\(", term)) |>
-  select(term, beta_re = estimate)
-
-comparison <- left_join(fe_tab, re_tab, by = "term")
-comparison
 
 ```
 
@@ -583,4 +557,5 @@ stargazer(data_2018[c("trade_value", "tariff_ahs","ntm_sps", "ntm_tbt")], type="
 stargazer(data_2019[c("trade_value", "tariff_ahs","ntm_sps", "ntm_tbt")], type="latex", title="Summary Statistics for 2014", out="table2014.tex", flip=FALSE)
 
 ```
+
 
