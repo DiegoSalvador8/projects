@@ -1,0 +1,1512 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+```{r}
+# Packages
+library(readr)
+library(dplyr)
+library(stringr)
+library(fixest)
+library(broom)
+library(gt)
+library(ggplot2)
+library(tidyr)
+library(forcats)
+library(countrycode)
+library(DBI)
+library(duckdb)
+library(arrow)
+library(scales)
+library(stargazer)
+library(ggthemes)
+library(cowplot)
+library(AER)
+library(plm)
+library(data.table)
+library(readxl)
+library(here)
+library(concordance)
+library(ggplot2)
+library(vtable)
+
+```
+
+
+```{r}
+#Import the ag data from ITPD-E first
+#Main dataset, the ITPD-E
+data <- read.csv("ITPDE_R03.CSV")
+# Inspect available years and variable names
+names(data)
+sort(unique(data$year))
+
+# Keep observations from 2012 to 2022. 2012 was chosen because of two reasons: 1) the collection year for NTMs, and 2) the HS2012 codes, so more technical issues can be avoided. The end year coincides with the latest year available.  
+us_trade_panel <- data |>
+  filter(
+    broad_sector == "Agriculture",
+    importer_iso3 == "USA",
+    year %in% c(2012,2013,2014,2015,2016,2017, 2018, 2019,2020,2021,2022)
+  )
+
+# Check observations
+us_trade_panel |>
+  count(year, name = "observations")
+
+us_trade_panel |>
+  summarise(
+    exporters = n_distinct(exporter_iso3),
+    industries = n_distinct(industry_id),
+    years = n_distinct(year)
+  )
+
+#Drop forestry and fishing
+unique(us_trade_panel$industry_descr)
+us_trade_panel <- us_trade_panel %>%
+  filter(!industry_descr %in% c("Forestry", "Fishing"))
+unique(us_trade_panel$year)
+write.csv(
+  us_trade_panel,
+  "us_trade_panel.csv"
+)
+us_trade_panel<-read_csv("us_trade_panel.csv")
+unique(us_trade_panel$year)
+```
+
+
+```{r}
+#Now, create the crosswalk. 
+#Next step: See the concordance tables. This table was done manually, using data provided by FAOSTAT. I compared the FCL item with the HS code (HS2012) and created a table which has both, to use as a crosswalk. Sources: 1) https://www.usitc.gov/data/gravity/gravity_portal_itpd_e for the IPTD-E commodity data. 2) https://www.fao.org/statistics/caliper/tools/download/en for the FAOSTAT classification.
+
+concordance_FCL_HS2012<- read_excel("concordance_tableITPDEupdated.xlsx")
+unique(concordance_FCL_HS2012$itpd_description)
+concordance_FCL_HS2012
+#Note: R did not drop leading 0s. 
+#Note: this object will be used to aggregate the HS codes later. 
+
+#To make this work: Expand the HS codes. There are rows in which multiple HS codes are written, so make one row per each first. 
+itpd_crosswalk <- concordance_FCL_HS2012%>%
+  mutate(HS_2012 = as.character(HS_2012)) %>%
+  separate_rows(HS_2012, sep = ",\\s*") %>%
+  mutate(
+    HS6 = str_pad(
+      str_trim(HS_2012),
+      width = 6,
+      side = "left",
+      pad = "0"
+    )
+  ) %>%
+  filter(!is.na(HS6), HS6 != "") %>%
+  distinct(HS6, itpd_description)
+unique(itpd_crosswalk$itpd_description)
+
+#Check that the industries match the ITPD-E industries perfectly
+
+setequal(
+  unique(itpd_crosswalk$itpd_description),
+  unique(us_trade_panel$industry_descr)
+)
+#There are rows that have different abbreviations or typos. Manually make them match. 
+itpd_crosswalk_final <- itpd_crosswalk %>%
+  mutate(
+    itpd_description = dplyr::recode(
+      itpd_description,
+      "Other meats, livest. r. live animals" =
+        "Other meats, livestock products, and live animals",
+      "Other ag. products, nec" =
+        "Other agricultural products, nec",
+      "Pulses  legumes(dried, preserved)" =
+        "Pulses and legumes, dried, preserved",
+      "Other oilseeds (exc. eanuts)" =
+        "Other oilseeds (excluding peanuts)",
+      "Prepared fruits, fruit juices" =
+        "Prepared fruits and fruit juices",
+      "Raw  refined sugar  sugar crops" =
+        "Raw and refined sugar and sugar crops",
+      "Animal feed ingredients pet foods" =
+        "Animal feed ingredients and pet foods",
+      "Tobacco leaves  cigarettes" =
+        "Tobacco leaves and cigarettes"
+    )
+  )
+setequal(
+  unique(itpd_crosswalk_final$itpd_description),
+  unique(us_trade_panel$industry_descr)
+)
+#This command returned TRUE, so the crosswalk is complete. 
+
+write_csv(
+  itpd_crosswalk_final,
+  "itpde_crosswalk.csv"
+)
+
+itpd_crosswalk_final<-read.csv("itpde_crosswalk.csv")
+```
+
+
+```{r}
+#Now start with NTM data
+ntm_file <- normalizePath(
+  "NTMs_HS2012Ver_Researcher.csv",
+  winslash = "/",
+  mustWork = TRUE
+)
+
+# Protect the path for use inside SQL
+ntm_file_sql <- gsub(
+  "'",
+  "''",
+  ntm_file,
+  fixed = TRUE
+)
+
+# Open a temporary DuckDB connection
+con <- dbConnect(
+  duckdb(),
+  dbdir = ":memory:"
+)
+
+# Read only the column names without importing the data into R
+column_names <- dbGetQuery(
+  con,
+  paste0(
+    "DESCRIBE SELECT * ",
+    "FROM read_csv_auto('",
+    ntm_file_sql,
+    "', header = true, all_varchar = true)"
+  )
+)
+
+print(column_names)
+
+#See the available countries
+reporter_values <- dbGetQuery(
+  con,
+  paste0(
+    "SELECT DISTINCT TRIM(\"Reporter\") AS Reporter ",
+    "FROM read_csv_auto('",
+    ntm_file_sql,
+    "', header = true, all_varchar = true) ",
+    "ORDER BY Reporter"
+  )
+)
+
+reporter_values
+#Filter for the US
+us_ntms <- dbGetQuery(
+  con,
+  paste0(
+    "SELECT * ",
+    "FROM read_csv_auto('",
+    ntm_file_sql,
+    "', header = true, all_varchar = true) ",
+    "WHERE TRIM(\"Reporter\") = 'USA'"
+  )
+)
+
+#See which years are available
+unique(us_ntms$Year) #note that the years that appear here are the collection years, not the years in which each NTM was introduced or terminated
+unique(us_ntms$MinStartYear) #years in which the NTMs started
+unique(us_ntms$MaxEndYear) #years in which the NTMs ended. 
+
+#Now only retain the HS codes present in the crosswalk, as they are the products of interest for each industry
+hs_codes_itpde<- itpd_crosswalk_final$HS6
+#Now in the NTM data, retain only these values 
+us_ntms <- us_ntms %>%
+  filter(HSCode %in% hs_codes_itpde)
+write_csv(
+  us_ntms,
+  "us_ntms_raw.csv"
+)
+us_ntms<-read.csv("us_ntms_raw.csv")
+
+head(us_ntms,500)
+
+#Make sure eveything is in the right type
+us_ntms <- us_ntms %>%
+  mutate(
+    HS6 = str_pad(
+      trimws(as.character(HSCode)),
+      width = 6,
+      side = "left",
+      pad = "0"
+    ),
+
+    NTMCode = trimws(
+      as.character(NTMCode)
+    ),
+
+    HSNomenclature = trimws(
+      as.character(HSNomenclature)
+    ),
+
+    Partner = trimws(
+      as.character(Partner)
+    ),
+
+    ReporterISON = trimws(
+      as.character(ReporterISON)
+    ),
+
+    PartnerISON = trimws(
+      as.character(PartnerISON)
+    ),
+
+    latest_year_flag = as.integer(
+      latest_year_flag
+    ),
+
+    MinStartYear = as.integer(
+      MinStartYear
+    ),
+
+    MaxEndYear = as.integer(
+      MaxEndYear
+    ),
+
+    ntm_all = as.numeric(
+      ntm_all
+    )
+  )
+#Do the same for the crosswalk
+crosswalk_for_join <- itpd_crosswalk_final %>%
+  transmute(
+    HS6 = str_pad(
+      trimws(as.character(HS6)),
+      width = 6,
+      side = "left",
+      pad = "0"
+    ),
+
+    itpd_description
+  )
+
+#See if everything looks right before (check NA)
+source_validation <- us_ntms %>%
+  summarise(
+    total_rows = n(),
+
+    missing_HS6 = sum(
+      is.na(HS6) | HS6 == ""
+    ),
+
+    missing_NTMCode = sum(
+      is.na(NTMCode) | NTMCode == ""
+    ),
+
+    missing_start_year = sum(
+      is.na(MinStartYear)
+    ),
+
+    missing_end_year = sum(
+      is.na(MaxEndYear)
+    ),
+
+    invalid_period = sum(
+      MinStartYear > MaxEndYear,
+      na.rm = TRUE
+    ),
+
+    missing_ntm_all = sum(
+      is.na(ntm_all)
+    ),
+
+    negative_ntm_all = sum(
+      ntm_all < 0,
+      na.rm = TRUE
+    )
+  )
+
+print(source_validation) #all zeros
+
+#The researcher database states that the column with "latest_year_flag" is a binary indicator to denote the year in which the data is current. Keep it. 
+us_ntmsSPS_TBT <- us_ntms %>%
+  filter(
+    latest_year_flag == 1,
+    HSNomenclature == "H4",
+    HS6 %in% crosswalk_for_join$HS6,
+    str_detect(NTMCode, "^[AB]"),#A,B are indicators for SPS and TBT
+    !is.na(MinStartYear),
+    !is.na(MaxEndYear),
+    !is.na(ntm_all),
+    MinStartYear <= MaxEndYear
+  ) %>%
+  mutate(
+    ntm_type = case_when(
+      str_starts(NTMCode, "A") ~ "SPS", #identifies the variables of interest
+      str_starts(NTMCode, "B") ~ "TBT", #identifies the variables of interest
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  left_join(
+    crosswalk_for_join,
+    by = "HS6",
+    relationship = "many-to-many"
+  )
+
+#Given the nature of the source dataset, the code from above most likely result in identical observations, so remove them
+ntm_source_unique <- us_ntmsSPS_TBT %>%
+  distinct(
+    ReporterISON,
+    PartnerISON,
+    Partner,
+    HS6,
+    NTMCode,
+    MinStartYear,
+    MaxEndYear,
+    itpd_description,
+    ntm_type,
+    ntm_all
+  )
+
+nrow(us_ntmsSPS_TBT) - nrow(ntm_source_unique)
+
+#Create the panel
+ntm_active <- ntm_source_unique %>%
+  filter(
+    MinStartYear <= 2022, #max year
+    MaxEndYear >= 2012 #min year
+  ) %>%
+  mutate(
+    first_active_year = pmax(
+      MinStartYear,
+      2012L
+    ),
+    last_active_year = pmin(
+      MaxEndYear,
+      2022L
+    )
+  ) %>%
+  rowwise() %>%
+  mutate(
+    year = list(
+      seq.int(
+        first_active_year,
+        last_active_year
+      )
+    )
+  ) %>%
+  unnest(year) %>%
+  ungroup()
+
+#Compute the counts. note that I am using "ntm_all", as it is the column with the total of measures for a given product. 
+#Counts
+ntm_counts <- ntm_active %>%
+  group_by(
+    ReporterISON,
+    Partner,
+    year,
+    itpd_description
+  ) %>%
+  summarise(
+    count_SPS = sum(
+      ntm_all[ntm_type == "SPS"]
+    ),
+    count_TBT = sum(
+      ntm_all[ntm_type == "TBT"]
+    ),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    count_total = count_SPS + count_TBT
+  )
+
+#Check
+ntm_counts %>%
+  summarise(
+    observations = n(),
+    missing_SPS = sum(is.na(count_SPS)),
+    missing_TBT = sum(is.na(count_TBT)),
+    negative_SPS = sum(count_SPS < 0),
+    negative_TBT = sum(count_TBT < 0)
+  ) #all good
+
+#Address the problem with the naming conventions that I had for the tariff data query. This problem will be explain in the code chunk for tariffs. 
+ntm_counts <- ntm_counts %>%
+  transmute(
+    importer_iso3 = "USA",
+
+    exporter_iso3 = case_when(
+      Partner == "ZAR" ~ "COD", #current ISO used in WITS
+      Partner == "ROM" ~ "ROU", #current ISO used in WITS
+      Partner == "TMP" ~ "TLS", #current ISO used in WITS
+      TRUE ~ Partner
+    ),
+
+    year = as.integer(year),
+
+    itpd_description = trimws(
+      as.character(itpd_description)
+    ),
+
+    count_SPS,
+    count_TBT,
+    count_total
+  )
+
+#verify
+ntm_counts %>%
+  filter(
+    exporter_iso3 %in% c(
+      "COD", "ROU", "TLS"
+    )
+  ) %>%
+  distinct(exporter_iso3)
+ntm_counts %>%
+  filter(
+    exporter_iso3 %in% c(
+      "ZAR", "ROM", "TMP"
+    )
+  ) %>%
+  distinct(exporter_iso3)#all good
+
+#Make sure that the panel has the same data types
+#Rename first
+us_trade_panel<-us_trade_panel %>%
+  rename(itpd_description=industry_descr)
+us_trade_panel <- us_trade_panel %>%
+  mutate(
+    importer_iso3 = trimws(
+      as.character(importer_iso3)
+    ),
+    exporter_iso3 = trimws(
+      as.character(exporter_iso3)
+    ),
+    year = as.integer(year),
+    itpd_description = trimws(
+      as.character(itpd_description)
+    )
+  )
+
+#Are there any missing combinations?
+missing_ntm_combinations <- us_trade_panel %>%
+  distinct(
+    importer_iso3,
+    exporter_iso3,
+    year,
+    itpd_description
+  ) %>%
+  anti_join( #the anti_join helps to identify them
+    ntm_counts,
+    by = c(
+      "importer_iso3",
+      "exporter_iso3",
+      "year",
+      "itpd_description"
+    )
+  )
+
+nrow(missing_ntm_combinations) #there are 11044 missing
+
+missing_ntm_combinations %>%
+  count(exporter_iso3, sort = TRUE)
+
+missing_ntm_combinations %>%
+  count(itpd_description, sort = TRUE)
+
+missing_ntm_combinations %>%
+  count(year, sort = TRUE)
+
+#There are missing because ntm_counts was generated from positive NTM records. Thus, a combination with neither an SPS nor TBT record did not generate a row.
+#Create explicit zero_count combinations while merging
+ntm_counts_complete <- us_trade_panel %>%
+  distinct(
+    importer_iso3,
+    exporter_iso3,
+    year,
+    itpd_description
+  ) %>%
+  left_join(
+    ntm_counts,
+    by = c(
+      "importer_iso3",
+      "exporter_iso3",
+      "year",
+      "itpd_description"
+    ),
+    relationship = "many-to-one"
+  ) %>%
+  mutate(
+    ntm_match_status = case_when(
+      !is.na(count_SPS) | !is.na(count_TBT) ~
+        "Recorded NTM combination",
+
+      importer_iso3 == exporter_iso3 ~
+        "Domestic trade: assigned zero", #there is USA-USA trade in the ITPDE
+
+      TRUE ~
+        "No recorded SPS/TBT: assigned zero"
+    ),
+
+    count_SPS = replace_na(count_SPS, 0),#taking care of the missing
+    count_TBT = replace_na(count_TBT, 0),#taking care of the missing
+    count_total = count_SPS + count_TBT
+  )
+
+#now the actual merge
+estimation_panel <- us_trade_panel %>%
+  left_join(
+    ntm_counts_complete,
+    by = c(
+      "importer_iso3",
+      "exporter_iso3",
+      "year",
+      "itpd_description"
+    ),
+    relationship = "many-to-one"
+  )
+#Check
+estimation_panel %>%
+  summarise(
+    observations = n(),
+    missing_SPS = sum(is.na(count_SPS)),
+    missing_TBT = sum(is.na(count_TBT)),
+    missing_total = sum(is.na(count_total)),
+    negative_SPS = sum(count_SPS < 0),
+    negative_TBT = sum(count_TBT < 0)
+  ) #all good
+
+#DONE
+write.csv(
+  estimation_panel,
+  "trade_NTMs"
+)
+```
+
+
+```{r}
+#Now clean the tariff data. Note: I will use AHS tariff rates at the HS-06 level. Analogous to the NTM data, I will group by industry and compute an average rate. Additionally, I will use MFN tariff rates for exporterxyearxindustry combinations that do not have an AHS rate. Important distinction: MFN rates do not vary by exporter, just by product. 
+#See all the HS codes that being studied. Refer to the crosswalk as before. 
+itpd_crosswalk_final <- itpd_crosswalk_final %>%
+  mutate(
+    HS6 = str_pad(as.character(HS6), width = 6, side = "left", pad = "0")
+  )
+hs_codes_WITS <- paste(
+  unique(na.omit(itpd_crosswalk_final$HS6)),
+  collapse = ","
+)
+writeClipboard(hs_codes_WITS) #this adds a copy to windows so I can paste into WITS for data extraction. 
+#Do the same thing for countries, but now refering to the estimation panel. 
+country_codes_WITS <- paste(
+  unique(na.omit(estimation_panel$exporter_iso3)),
+  collapse = ","
+)
+writeClipboard(country_codes_WITS)
+#Note: WITS did not accept the ISO3 codes for: COD,MNE,ROU,SRB,TLS. Source: https://wits.worldbank.org/wits/WITS/WITSHELP/Content/Codes/Country_Codes.htm
+#COD->ZAR "Democratic Republic of Congo"
+#ROU->ROM "Romania"
+#TLS->TMP "Timor-Leste/East Timor"
+#MNE,SRB are reported jointly by WITS. Decision: drop observations for those. 
+estimation_panel <- estimation_panel %>%
+  filter(!exporter_iso3 %in% c("MNE", "SRB"))
+#Note: when querying the data, select "TRAINS" as the data source, as it allows to include AVE equivalents using the "UNCTAD Method". 
+tariff_raw<-read.csv("tariff_data.csv")
+head(tariff_raw,10000)
+tariff_raw <- tariff_raw %>%
+  rename(HS6 = Product,
+         year = Tariff.Year)
+#Leading zeros
+tariff_raw <- tariff_raw %>%
+  mutate(
+    HS6 = str_pad(as.character(HS6), width = 6, side = "left", pad = "0")
+  )
+#Assign industries
+tariff_raw <- tariff_raw %>%
+  left_join(
+    itpd_crosswalk_final %>%
+      select(HS6, itpd_description) %>%
+      distinct(),
+    by = "HS6",
+    relationship ="many-to-many"
+  )
+
+#Filter the data. Retain only AHS since the BND are rate ceilings, which are not relevant for this project.The MFN data comes from a different download.  
+unique(tariff_raw$DutyType)
+tariff_AHS <- tariff_raw %>%
+  filter(!DutyType %in% c("MFN","BND"))
+head(tariff_AHS,10000)
+head(estimation_panel)
+#Before merging, note that there is no ISO3 code column available. See if the partner names match the main panel. 
+
+all(tariff_AHS$Partner.Name %in% estimation_panel$exporter_name) #FALSE
+setdiff(
+  unique(estimation_panel$exporter_name),
+  unique(tariff_AHS$Partner.Name)
+)
+#Issue: different naming conventions...Fix: create a manual crosswalk, using the query from WITS to create the ISO3 column. This is the easier fix because I extracted the ISO3 codes from the estimation panel earlier. 
+library(dplyr)
+
+wits_crosswalk <- read.table(
+  text = "
+Partner.Name|exporter_iso3
+Afghanistan|AFG
+Albania|ALB
+Algeria|DZA
+Angola|AGO
+Antigua and Barbuda|ATG
+Argentina|ARG
+Armenia|ARM
+Australia|AUS
+Austria|AUT
+Azerbaijan|AZE
+Bahamas, The|BHS
+Bahrain|BHR
+Bangladesh|BGD
+Barbados|BRB
+Belarus|BLR
+Belgium|BEL
+Belize|BLZ
+Benin|BEN
+Bhutan|BTN
+Bolivia|BOL
+Bosnia and Herzegovina|BIH
+Botswana|BWA
+Brazil|BRA
+Brunei|BRN
+Bulgaria|BGR
+Burkina Faso|BFA
+Burundi|BDI
+Cambodia|KHM
+Cameroon|CMR
+Canada|CAN
+Cape Verde|CPV
+Central African Republic|CAF
+Chad|TCD
+Chile|CHL
+China|CHN
+Colombia|COL
+Comoros|COM
+Congo, Dem. Rep.|ZAR
+Congo, Rep.|COG
+Cook Islands|COK
+Costa Rica|CRI
+Cote d'Ivoire|CIV
+Croatia|HRV
+Cyprus|CYP
+Czech Republic|CZE
+Denmark|DNK
+Djibouti|DJI
+Dominica|DMA
+Dominican Republic|DOM
+East Timor|TMP
+Ecuador|ECU
+Egypt, Arab Rep.|EGY
+El Salvador|SLV
+Equatorial Guinea|GNQ
+Eritrea|ERI
+Estonia|EST
+Eswatini|SWZ
+Ethiopia(excludes Eritrea)|ETH
+Faeroe Islands|FRO
+Fiji|FJI
+Finland|FIN
+Fm Sudan|SDN
+France|FRA
+French Polynesia|PYF
+Gabon|GAB
+Gambia, The|GMB
+Georgia|GEO
+Germany|DEU
+Ghana|GHA
+Greece|GRC
+Grenada|GRD
+Guatemala|GTM
+Guinea|GIN
+Guinea-Bissau|GNB
+Guyana|GUY
+Haiti|HTI
+Honduras|HND
+Hong Kong, China|HKG
+Hungary|HUN
+Iceland|ISL
+India|IND
+Indonesia|IDN
+Iran, Islamic Rep.|IRN
+Iraq|IRQ
+Ireland|IRL
+Israel|ISR
+Italy|ITA
+Jamaica|JAM
+Japan|JPN
+Jordan|JOR
+Kazakhstan|KAZ
+Kenya|KEN
+Kiribati|KIR
+Korea, Rep.|KOR
+Kuwait|KWT
+Kyrgyz Republic|KGZ
+Lao PDR|LAO
+Latvia|LVA
+Lebanon|LBN
+Lesotho|LSO
+Liberia|LBR
+Libya|LBY
+Lithuania|LTU
+Luxembourg|LUX
+Macao|MAC
+Madagascar|MDG
+Malawi|MWI
+Malaysia|MYS
+Maldives|MDV
+Mali|MLI
+Malta|MLT
+Marshall Islands|MHL
+Mauritania|MRT
+Mauritius|MUS
+Mexico|MEX
+Micronesia, Fed. Sts.|FSM
+Moldova|MDA
+Mongolia|MNG
+Morocco|MAR
+Mozambique|MOZ
+Myanmar|MMR
+Namibia|NAM
+Naoero|NRU
+Nepal|NPL
+Netherlands|NLD
+New Caledonia|NCL
+New Zealand|NZL
+Nicaragua|NIC
+Niger|NER
+Nigeria|NGA
+Niue|NIU
+North Macedonia|MKD
+Norway|NOR
+Occ.Pal.Terr|PSE
+Oman|OMN
+Pakistan|PAK
+Panama|PAN
+Papua New Guinea|PNG
+Paraguay|PRY
+Peru|PER
+Philippines|PHL
+Poland|POL
+Portugal|PRT
+Qatar|QAT
+Romania|ROM
+Russian Federation|RUS
+Rwanda|RWA
+Samoa|WSM
+Sao Tome and Principe|STP
+Saudi Arabia|SAU
+Senegal|SEN
+Seychelles|SYC
+Sierra Leone|SLE
+Singapore|SGP
+Slovak Republic|SVK
+Slovenia|SVN
+Solomon Islands|SLB
+Somalia|SOM
+South Africa|ZAF
+South Sudan|SSD
+Spain|ESP
+Sri Lanka|LKA
+St. Kitts and Nevis|KNA
+St. Lucia|LCA
+St. Vincent and the Grenadines|VCT
+Suriname|SUR
+Sweden|SWE
+Switzerland|CHE
+Syrian Arab Republic|SYR
+Taiwan, China|TWN
+Tajikistan|TJK
+Tanzania|TZA
+Thailand|THA
+Togo|TGO
+Tokelau|TKL
+Tonga|TON
+Trinidad and Tobago|TTO
+Tunisia|TUN
+Turkey|TUR
+Turkmenistan|TKM
+Uganda|UGA
+Ukraine|UKR
+United Arab Emirates|ARE
+United Kingdom|GBR
+United States|USA
+Uruguay|URY
+Uzbekistan|UZB
+Vanuatu|VUT
+Venezuela|VEN
+Vietnam|VNM
+Yemen|YEM
+Zambia|ZMB
+Zimbabwe|ZWE
+",
+  header = TRUE,
+  sep = "|",
+  quote = "",
+  comment.char = "",
+  stringsAsFactors = FALSE,
+  strip.white = TRUE
+)
+
+tariff_AHS <- tariff_AHS %>%
+  left_join(
+    wits_crosswalk,
+    by = "Partner.Name",
+    relationship = "many-to-one"
+  )
+
+tariff_AHS %>%
+  filter(is.na(exporter_iso3)) %>%
+  distinct(Partner.Name) #all matched. 
+#Note: the manually corrected codes need to be changed before merging. Refer to the note above in the data extraction step. 
+tariff_AHS <- tariff_AHS %>%
+  mutate(
+    exporter_iso3 = case_when(
+      exporter_iso3 == "ZAR" ~ "COD",
+      exporter_iso3 == "ROM" ~ "ROU",
+      exporter_iso3 == "TMP" ~ "TLS",
+      TRUE ~ exporter_iso3
+    )
+  )
+
+tariff_AHS %>%
+  filter(exporter_iso3 %in% c("ZAR", "ROM", "TMP")) %>%
+  distinct(exporter_iso3)
+#Verify that all the ISO codes are contained in the estimation panel. 
+all(tariff_AHS$exporter_iso3 %in% estimation_panel$exporter_iso3) #TRUE
+
+#Now, calculate the simple averages per industry, so they can be later merged. library(dplyr)
+
+tariffs_industry <- tariff_AHS %>%
+  group_by(
+    year,
+    exporter_iso3,
+    itpd_description
+  ) %>%
+  summarise(
+    tariff_simple_average = if (
+      all(is.na(Simple.Average))
+    ) {
+      NA_real_
+    } else {
+      mean(Simple.Average, na.rm = TRUE)
+    },
+    number_hs_codes = n_distinct(HS6),
+    hs_codes_with_tariff = n_distinct(
+      HS6[!is.na(Simple.Average)]
+    ),
+    .groups = "drop"
+  )
+#Example
+tariffs_industry %>%
+  filter(
+    year == 2012,
+    exporter_iso3 == "CAN"
+  ) %>%
+  arrange(itpd_description) %>%
+  View()
+head(tariffs_industry)
+sum(is.na(tariffs_industry$tariff_simple_average))
+#There are 135 values with NA. I will use the MFN rates to solve this issue later. Note: the MFN rates are for each HS x year, meaning that they do not vary by exporter. 
+
+#Now, merge to the estimation panel. 
+
+estimation_panel <- estimation_panel %>%
+  left_join(
+    tariffs_industry %>%
+      select(
+        year,
+        exporter_iso3,
+        itpd_description,
+        tariff_simple_average
+      ),
+    by = c(
+      "year",
+      "exporter_iso3",
+      "itpd_description"
+    ),
+    relationship = "many-to-one"
+  )
+
+head(estimation_panel) #Good, now it is time to take care of the missing rates. 
+#Checkpoint: 
+write.csv(
+  estimation_panel,
+  "trade_panel_ntms_ahs.csv"
+)
+```
+
+
+```{r}
+#Now, solve the missing tariffs issue. First, load the mfn data. 
+mfn2012<-read.csv("mfn2012.csv")
+mfn2013<-read.csv("mfn2013.csv")
+mfn2014<-read.csv("mfn2014.csv")
+mfn2015<-read.csv("mfn2015.csv")
+mfn2016<-read.csv("mfn2016.csv")
+mfn2017<-read.csv("mfn2017.csv")
+mfn2018<-read.csv("mfn2018.csv")
+mfn2019<-read.csv("mfn2019.csv")
+mfn2020<-read.csv("mfn2020.csv")
+mfn2021<-read.csv("mfn2021.csv")
+mfn2022<-read.csv("mfn2022.csv")
+
+mfn_all <- bind_rows(
+  mfn2012,
+  mfn2013,
+  mfn2014,
+  mfn2015,
+  mfn2016,
+  mfn2017,
+  mfn2018,
+  mfn2019,
+  mfn2020,
+  mfn2021,
+  mfn2022
+)
+#leading zeros
+mfn_all <- mfn_all %>%
+  mutate(
+    ProductCode = str_pad(as.character(ProductCode), width = 6, side = "left", pad = "0")
+  )
+
+#Rename to make it easier
+mfn_all <- mfn_all %>%
+  rename(HS6 = ProductCode,
+         year = Year)
+
+#Assign industries
+mfn_all <- mfn_all %>%
+  left_join(
+    itpd_crosswalk_final %>%
+      select(HS6, itpd_description) %>%
+      distinct(),
+    by = "HS6",
+    relationship ="many-to-many"
+  )
+head(mfn_all)
+
+#Analogous aggregation by industry. 
+mfn_industries <- mfn_all %>%
+  group_by(
+    year,
+    itpd_description
+  ) %>%
+  summarise(
+    tariff_simple_average = if (
+      all(is.na(SimpleAverage))
+    ) {
+      NA_real_
+    } else {
+      mean(SimpleAverage, na.rm = TRUE)
+    },
+    number_hs_codes = n_distinct(HS6),
+    hs_codes_with_tariff = n_distinct(
+      HS6[!is.na(SimpleAverage)]
+    ),
+    .groups = "drop"
+  )
+unique(mfn_all$itpd_description) #there is an NA here because the data had hs codes that are outside of the scope of this project. Nevertheless, see if all the values in the estimation panel exist in this dataset. 
+all(estimation_panel$itpd_description %in% mfn_industries$itpd_description) #True, so all good. 
+#Note: I am doing all of this with the MFN rates so I can populate the NA values that the AHS tariffs left in the estimation panel. Lets do that. 
+
+mfn_industries %>%
+  count(year, itpd_description) %>%
+  filter(n > 1) #one observation per year x industry. 
+
+estimation_panel <- estimation_panel %>%
+  left_join(
+    mfn_industries %>%
+      select(
+        year,
+        itpd_description,
+        mfn_tariff = tariff_simple_average #renames the column. It prevents R from creating confusing names because this column name already exists in the estimation panel.
+      ),
+    by = c("year", "itpd_description"), #matching variables
+    relationship = "many-to-one"
+  ) %>%
+  mutate(
+    tariff_source = case_when(
+      !is.na(tariff_simple_average) ~ "AHS", #if the original tariff is not missing, this labels it as AHS, so the original AHS tariff is retained. 
+      is.na(tariff_simple_average) & !is.na(mfn_tariff) ~ "MFN replacement", #this part labels the tariff rate that comes from MFN as the replacement
+      TRUE ~ "Missing"
+    ),
+    tariff_simple_average = coalesce(
+      tariff_simple_average,
+      mfn_tariff
+    )
+  ) %>%
+  select(-mfn_tariff) #After mfn_tariff has been used to fill missing observations, this removes the temporary column.
+
+#coalesce() operates as follows:
+#If estimation_panel$tariff_simple_average is available, it remains unchanged.
+#If it is NA, R uses the corresponding tariff from mfn_industries.
+#If both values are NA, the result remains NA.
+
+head(estimation_panel,10000)
+sum(is.na(estimation_panel$tariff_simple_average))
+
+#which are still missing
+missing_tariffs <- estimation_panel %>%
+  filter(is.na(tariff_simple_average)) %>%
+  distinct(
+    exporter_iso3,
+    year,
+    itpd_description
+  ) %>%
+  arrange(
+    exporter_iso3,
+    year,
+    itpd_description
+  )
+#All the missing values come from the industry "eggs". The PPML will drop the rows that have this issue, which are 617 observations. This amount represents 0.0195% (617/31,634 observations) of all the panel. Since the percentage is very low, just let R drop them when making the calculations. Thus, the data construction process is done. Now, move to the estimation step. This will be included in the methodology section when describing the unique dataset.
+
+estimation_panel <- estimation_panel %>%
+  filter(exporter_iso3 != importer_iso3) #get rid of domestic trade
+
+
+estimation_panel %>%
+  summarise(
+    observations       = n(),
+    missing_trade      = sum(is.na(trade)),
+    missing_SPS        = sum(is.na(count_SPS)),
+    missing_TBT        = sum(is.na(count_TBT)),
+    missing_tariff     = sum(is.na(tariff_simple_average)),
+    negative_trade     = sum(trade < 0),
+    negative_SPS       = sum(count_SPS < 0),
+    negative_TBT       = sum(count_TBT < 0),
+    inconsistent_total = sum(
+      count_total != count_SPS + count_TBT
+    )
+  )
+
+
+#get rid of the extra columns
+colnames(estimation_panel)
+estimation_panel <- estimation_panel %>% select(-X)
+
+write.csv(
+  estimation_panel,
+  "final_panel.csv"
+)
+estimation_panel<-read.csv("final_panel.csv")
+
+
+```
+
+
+```{r}
+#Now, estimate the PPML. Before estimation, convert tariffs into decimals
+estimation_panel <- estimation_panel %>%
+  mutate(
+    tariff_decimal = tariff_simple_average / 100)
+
+#Now with the model
+m_pooled <- fepois(
+  trade ~ log1p(tariff_decimal) +
+          log1p(count_SPS) + log1p(count_TBT)|
+          itpd_description^year +
+          exporter_iso3^itpd_description +
+          exporter_iso3^year,
+  cluster = ~ exporter_iso3,
+  data = estimation_panel
+)
+etable(m_pooled)
+
+#Notes: Clustering by exporter allows arbitrary correlation among observations belonging to the same exporter while continuing to treat different exporters as independent clusters. Canada observations may be correlated with other Canada observations. Mexico observations may be correlated with other Mexico observations. Canada and Mexico are treated as separate clusters.
+
+#Note that the fixed effects simplified logic: 
+
+#itpd_description^year absorbs global industry-specific shocks or changing demand patterns over time. 
+#exporter_iso3^itpd_description becomes exporter fixed effects. Absorbs time-invariant bilateral trade costs specific to that industry
+#exporter_iso3^year absorbs global industry-specific shocks or changing demand patterns over time.
+
+
+#Now lets look at OECD vs non_OECD countries
+oecd_iso3 <- c(
+  "AUS", "AUT", "BEL", "CAN", "CHL", "COL", "CRI",
+  "CZE", "DNK", "EST", "FIN", "FRA", "DEU", "GRC",
+  "HUN", "ISL", "IRL", "ISR", "ITA", "JPN", "KOR",
+  "LVA", "LTU", "LUX", "MEX", "NLD", "NZL", "NOR",
+  "POL", "PRT", "SVK", "SVN", "ESP", "SWE", "CHE",
+  "TUR", "GBR", "USA"
+)
+
+estimation_sample <- estimation_panel %>%
+  mutate(
+    oecd_group = if_else(
+      exporter_iso3 %in% oecd_iso3,
+      "OECD",
+      "Non-OECD"
+    )
+  )
+
+#Check classification
+estimation_sample %>%
+  distinct(exporter_iso3, exporter_name, oecd_group) %>%
+  arrange(oecd_group, exporter_iso3) %>%
+  View()
+
+#Estimate the OECD model
+m_oecd <- fepois(
+  trade ~ log1p(tariff_decimal) +
+          log1p(count_SPS) +
+          log1p(count_TBT) |
+          itpd_description^year +
+          exporter_iso3^itpd_description +
+          exporter_iso3^year,
+  cluster = ~ exporter_iso3,
+  data = estimation_sample %>%
+    filter(oecd_group == "OECD")
+)
+
+#now the non-OECD model 
+m_non_oecd <- fepois(
+  trade ~ log1p(tariff_decimal) +
+          log1p(count_SPS) +
+          log1p(count_TBT) |
+          itpd_description^year +
+          exporter_iso3^itpd_description +
+          exporter_iso3^year,
+  cluster = ~ exporter_iso3,
+  data = estimation_sample %>%
+    filter(oecd_group == "Non-OECD")
+)
+
+#Display them side-by-side
+etable(m_pooled,m_oecd,m_non_oecd,
+       tex = TRUE,
+       headers = c("All Countries", "OECD Countries", "Non-OECD Countries"))
+
+#This is the heart of the thesis.  
+```
+
+
+```{r}
+
+library(modelsummary)
+#Start with the modelling of the heterogeneous effects between agricultural industries. It is to be determined if these models will be included in the main paper or as an appendix. 
+unique(estimation_sample$itpd_description)
+industries<-unique(estimation_sample$itpd_description)
+industries<-as.data.frame(industries)
+industries
+#Lets run three models for each broad group, as defined in the paper:
+#Larch, M., Luckstead, J., & Yotov, Y. V. (2024). Economic sanctions and agricultural trade. American Journal of Agricultural Economics, 106(4), 1477-1517.. A pooled one, OECD, and non-OECD. First map them
+library(dplyr)
+unique(estimation_sample$itpd_description)
+unique(estimation_sample$aggregated_sector)
+estimation_sample <- estimation_sample %>%
+  mutate(
+    aggregated_sector = case_when(
+      
+      itpd_description %in% c(
+        "Wheat",
+        "Rice (raw)",
+        "Corn",
+        "Other cereals",
+        "Cereal products",
+        "Soybeans",
+        "Other oilseeds (excluding peanuts)",
+        "Animal feed ingredients and pet foods",
+        "Pulses and legumes, dried, preserved",
+        "Cotton"
+      ) ~ "Bulk commodities",
+      
+      itpd_description %in% c(
+        "Raw and refined sugar and sugar crops",
+        "Other sweeteners"
+      ) ~ "Sugars",
+      
+      itpd_description %in% c(
+        "Fresh fruit",
+        "Fresh vegetables",
+        "Nuts",
+        "Cocoa and cocoa products"
+      ) ~ "Labor-intensive crops",
+      
+      itpd_description %in% c(
+        "Prepared fruits and fruit juices",
+        "Prepared vegetables",
+        "Beverages, nec",
+        "Tobacco leaves and cigarettes",
+        "Spices",
+        "Other agricultural products, nec"
+      ) ~ "Processed foods",
+      
+      itpd_description %in% c(
+        "Live Cattle",
+        "Live Swine",
+        "Eggs",
+        "Other meats, livestock products, and live animals"
+      ) ~ "Live animals, meat, and animal products",
+      
+      TRUE ~ NA_character_
+    )
+  )
+
+#1) Bulk commodities
+
+m_bulkcommodities <- estimation_sample %>%
+  filter(aggregated_sector == "Bulk commodities") %>%
+  fepois(
+    trade ~ log1p(tariff_decimal) +
+            log1p(count_SPS) +
+            log1p(count_TBT) |
+            exporter_iso3^year + 
+      exporter_iso3^itpd_description + itpd_description^year,
+    cluster = ~ exporter_iso3,
+    data = .
+  )
+etable(m_bulkcommodities)
+
+m_bulkcommodities_OECD <- estimation_sample %>%
+  filter(aggregated_sector == "Bulk commodities",
+         oecd_group == "OECD") %>%
+  fepois(
+    trade ~ log1p(tariff_decimal) +
+            log1p(count_SPS) +
+            log1p(count_TBT) |
+            exporter_iso3^year + 
+      exporter_iso3^itpd_description + itpd_description^year,
+    cluster = ~ exporter_iso3,
+    data = .
+  )
+etable(m_bulkcommodities_OECD)
+
+m_bulkcommodities_noOECD <- estimation_sample %>%
+  filter(aggregated_sector == "Bulk commodities",
+         oecd_group == "Non-OECD") %>%
+  fepois(
+    trade ~ log1p(tariff_decimal) +
+            log1p(count_SPS) +
+            log1p(count_TBT) |
+            exporter_iso3^year + 
+      exporter_iso3^itpd_description + itpd_description^year,
+    cluster = ~ exporter_iso3,
+    data = .
+  )
+etable(m_bulkcommodities_noOECD)
+#Note that only the tariff variable had enough variation to show a coefficient. Let's create a table that show the three models. 
+etable(m_bulkcommodities, m_bulkcommodities_OECD, m_bulkcommodities_noOECD, 
+       tex = TRUE,
+       headers = c("All Countries", "OECD Countries", "Non-OECD Countries"))
+#I will change the name of the variable when the tables are exported into the thesis, for aesthetic purposes. 
+#I will run the remaining models in one chunk each, so it is easier to follow.
+```
+
+
+```{r}
+#2) Sugars
+
+m_sugars <- estimation_sample %>%
+  filter(aggregated_sector == "Sugars") %>%
+  fepois(
+    trade ~ log1p(tariff_decimal) +
+            log1p(count_SPS) +
+            log1p(count_TBT) |
+            exporter_iso3^year + 
+      exporter_iso3^itpd_description + itpd_description^year,
+    cluster = ~ exporter_iso3,
+    data = .
+  )
+etable(m_sugars)
+
+m_sugarsOECD <- estimation_sample %>%
+  filter(aggregated_sector == "Sugars",
+         oecd_group == "OECD") %>%
+  fepois(
+    trade ~ log1p(tariff_decimal) +
+            log1p(count_SPS) +
+            log1p(count_TBT) |
+            exporter_iso3^year + 
+      exporter_iso3^itpd_description + itpd_description^year,
+    cluster = ~ exporter_iso3,
+    data = .
+  )
+etable(m_sugarsOECD)
+
+m_sugars_noOECD <- estimation_sample %>%
+  filter(aggregated_sector == "Sugars",
+         oecd_group == "Non-OECD") %>%
+  fepois(
+    trade ~ log1p(tariff_decimal) +
+            log1p(count_SPS) +
+            log1p(count_TBT) |
+            exporter_iso3^year + 
+      exporter_iso3^itpd_description + itpd_description^year,
+    cluster = ~ exporter_iso3,
+    data = .
+  )
+etable(m_sugars_noOECD)
+
+etable(m_sugars, m_sugarsOECD, m_sugars_noOECD, 
+       tex = TRUE,
+       headers = c("All Countries", "OECD Countries", "Non-OECD Countries"))
+#Note: positive and significant coefficient for tariffs. Most definitely an endogeneity problem. Future research to address it.
+```
+
+
+```{r}
+#3) Labor-intensive crops
+m_labor <- estimation_sample %>%
+  filter(aggregated_sector == "Labor-intensive crops") %>%
+  fepois(
+    trade ~ log1p(tariff_decimal) +
+            log1p(count_SPS) +
+            log1p(count_TBT) |
+            exporter_iso3^year + 
+      exporter_iso3^itpd_description + itpd_description^year,
+    cluster = ~ exporter_iso3,
+    data = .
+  )
+etable(m_labor)
+
+m_laborOECD <- estimation_sample %>%
+  filter(aggregated_sector == "Labor-intensive crops",
+         oecd_group == "OECD") %>%
+  fepois(
+    trade ~ log1p(tariff_decimal) +
+            log1p(count_SPS) +
+            log1p(count_TBT) |
+            exporter_iso3^year + 
+      exporter_iso3^itpd_description + itpd_description^year,
+    cluster = ~ exporter_iso3,
+    data = .
+  )
+etable(m_laborOECD)
+
+m_labor_noOECD <- estimation_sample %>%
+  filter(aggregated_sector == "Labor-intensive crops",
+         oecd_group == "Non-OECD") %>%
+  fepois(
+    trade ~ log1p(tariff_decimal) +
+            log1p(count_SPS) +
+            log1p(count_TBT) |
+            exporter_iso3^year + 
+      exporter_iso3^itpd_description + itpd_description^year,
+    cluster = ~ exporter_iso3,
+    data = .
+  )
+etable(m_labor_noOECD)
+
+etable(m_labor, m_laborOECD, m_labor_noOECD, 
+       tex = TRUE,
+       headers = c("All Countries", "OECD Countries", "Non-OECD Countries"))
+
+```
+
+
+```{r}
+#4) Processed Foods
+m_processed <- estimation_sample %>%
+  filter(aggregated_sector == "Processed foods") %>%
+  fepois(
+    trade ~ log1p(tariff_decimal) +
+            log1p(count_SPS) +
+            log1p(count_TBT) |
+            exporter_iso3^year + 
+      exporter_iso3^itpd_description + itpd_description^year,
+    cluster = ~ exporter_iso3,
+    data = .
+  )
+etable(m_processed)
+
+m_processedOECD <- estimation_sample %>%
+  filter(aggregated_sector == "Processed foods",
+         oecd_group == "OECD") %>%
+  fepois(
+    trade ~ log1p(tariff_decimal) +
+            log1p(count_SPS) +
+            log1p(count_TBT) |
+            exporter_iso3^year + 
+      exporter_iso3^itpd_description + itpd_description^year,
+    cluster = ~ exporter_iso3,
+    data = .
+  )
+etable(m_processedOECD)
+
+m_processed_noOECD <- estimation_sample %>%
+  filter(aggregated_sector == "Processed foods",
+         oecd_group == "Non-OECD") %>%
+  fepois(
+    trade ~ log1p(tariff_decimal) +
+            log1p(count_SPS) +
+            log1p(count_TBT) |
+            exporter_iso3^year + 
+      exporter_iso3^itpd_description + itpd_description^year,
+    cluster = ~ exporter_iso3,
+    data = .
+  )
+etable(m_processed_noOECD)
+
+etable(m_processed, m_processedOECD, m_processed_noOECD, 
+       tex = TRUE,
+       headers = c("All Countries", "OECD Countries", "Non-OECD Countries"))
+
+```
+
+
+```{r}
+#4) Live animals, meat, and animal products
+m_animals <- estimation_sample %>%
+  filter(aggregated_sector == "Live animals, meat, and animal products") %>%
+  fepois(
+    trade ~ log1p(tariff_decimal) +
+            log1p(count_SPS) +
+            log1p(count_TBT) |
+            exporter_iso3^year + 
+      exporter_iso3^itpd_description + itpd_description^year,
+    cluster = ~ exporter_iso3,
+    data = .
+  )
+etable(m_animals)
+
+m_animalsOECD <- estimation_sample %>%
+  filter(aggregated_sector == "Live animals, meat, and animal products",
+         oecd_group == "OECD") %>%
+  fepois(
+    trade ~ log1p(tariff_decimal) +
+            log1p(count_SPS) +
+            log1p(count_TBT) |
+            exporter_iso3^year + 
+      exporter_iso3^itpd_description + itpd_description^year,
+    cluster = ~ exporter_iso3,
+    data = .
+  )
+etable(m_animalsOECD)
+
+m_animals_noOECD <- estimation_sample %>%
+  filter(aggregated_sector == "Live animals, meat, and animal products",
+         oecd_group == "Non-OECD") %>%
+  fepois(
+    trade ~ log1p(tariff_decimal) +
+            log1p(count_SPS) +
+            log1p(count_TBT) |
+            exporter_iso3^year + 
+      exporter_iso3^itpd_description + itpd_description^year,
+    cluster = ~ exporter_iso3,
+    data = .
+  )
+etable(m_animals_noOECD)
+
+etable(m_animals, m_animalsOECD, m_animals_noOECD, 
+       tex = TRUE,
+       headers = c("All Countries", "OECD Countries", "Non-OECD Countries"))
+
+
+#Takeaway: There is definitely some endegoneity going on for the models that showed positive tariff rates. Interestingly, these coefficients showed up on non-OECD countries. Might be because of lower trade values. This will be adressed in the robustness checks, with a lagged tariff rate as an instrument.
+```
+
+
+```{r}
+#Data description statistics and other metrics
+stargazer(estimation_sample)
+datasummary(tariff_decimal ~ Mean + SD + Min + Median + Max + N, 
+            data = estimation_sample, 
+            output = "latex")
+```
+
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Ctrl+Alt+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
